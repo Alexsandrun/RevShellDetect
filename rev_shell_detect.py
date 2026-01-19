@@ -23,6 +23,36 @@ SHELL_NAMES = {
     "fish",
 }
 
+SUSPICIOUS_COMMANDS = {
+    "bash",
+    "sh",
+    "zsh",
+    "ksh",
+    "dash",
+    "ash",
+    "tcsh",
+    "csh",
+    "fish",
+    "busybox",
+    "nc",
+    "netcat",
+    "ncat",
+    "socat",
+    "telnet",
+    "python",
+    "python3",
+    "perl",
+    "php",
+    "ruby",
+    "irb",
+    "node",
+    "nodejs",
+    "java",
+    "lua",
+    "go",
+    "openssl",
+}
+
 
 @dataclass(frozen=True)
 class Connection:
@@ -41,7 +71,7 @@ class Finding:
     connection: Connection
 
 
-def parse_proc_net_tcp(path: Path) -> list[Connection]:
+def parse_proc_net(path: Path, protocol: str) -> list[Connection]:
     connections: list[Connection] = []
     if not path.exists():
         return connections
@@ -51,10 +81,12 @@ def parse_proc_net_tcp(path: Path) -> list[Connection]:
         if len(parts) < 10:
             continue
         local_hex, remote_hex, state, inode = parts[1], parts[2], parts[3], parts[9]
-        if state != "01":
+        if protocol == "tcp" and state != "01":
             continue
         local_ip, local_port = decode_address(local_hex)
         remote_ip, remote_port = decode_address(remote_hex)
+        if protocol == "udp" and remote_port == 0:
+            continue
         connections.append(
             Connection(
                 local_ip=local_ip,
@@ -69,8 +101,18 @@ def parse_proc_net_tcp(path: Path) -> list[Connection]:
 
 def decode_address(hex_value: str) -> tuple[str, int]:
     address, port = hex_value.split(":")
-    ip = socket.inet_ntoa(bytes.fromhex(address)[::-1])
+    ip = decode_ip(address)
     return ip, int(port, 16)
+
+
+def decode_ip(address: str) -> str:
+    if len(address) == 8:
+        return socket.inet_ntoa(bytes.fromhex(address)[::-1])
+    if len(address) == 32:
+        raw = bytes.fromhex(address)
+        reordered = b"".join(raw[i : i + 4][::-1] for i in range(0, 16, 4))
+        return str(ipaddress.IPv6Address(reordered))
+    return "0.0.0.0"
 
 
 def is_suspicious_remote(ip: str, allow_private: bool) -> bool:
@@ -133,8 +175,8 @@ def find_reverse_shells(
             continue
         for pid in inode_map.get(conn.inode, []):
             comm = read_comm(pid)
-            if comm in SHELL_NAMES:
-                cmdline = read_cmdline(pid)
+            cmdline = read_cmdline(pid)
+            if is_suspicious_process(comm, cmdline):
                 findings.append(
                     Finding(
                         pid=pid,
@@ -144,6 +186,16 @@ def find_reverse_shells(
                     )
                 )
     return findings
+
+
+def is_suspicious_process(comm: str, cmdline: str) -> bool:
+    comm_lower = comm.lower()
+    cmd_lower = cmdline.lower()
+    if comm_lower in SHELL_NAMES or comm_lower in SUSPICIOUS_COMMANDS:
+        return True
+    return any(token in cmd_lower for token in SUSPICIOUS_COMMANDS) or any(
+        marker in cmd_lower for marker in ("/dev/tcp", "/dev/udp", "mkfifo")
+    )
 
 
 def format_finding(finding: Finding) -> str:
@@ -170,7 +222,11 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
 
-    connections = parse_proc_net_tcp(Path("/proc/net/tcp"))
+    connections: list[Connection] = []
+    connections.extend(parse_proc_net(Path("/proc/net/tcp"), "tcp"))
+    connections.extend(parse_proc_net(Path("/proc/net/tcp6"), "tcp"))
+    connections.extend(parse_proc_net(Path("/proc/net/udp"), "udp"))
+    connections.extend(parse_proc_net(Path("/proc/net/udp6"), "udp"))
     inode_map = build_inode_map()
     findings = find_reverse_shells(connections, inode_map, args.include_private)
 
